@@ -1,327 +1,11 @@
 import json
-import os
-import time
-from collections import deque
-from datetime import datetime, timezone
-from typing import Any, Callable, Deque, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-
-DEMO_MODE = os.getenv("AGENT_DEMO") == "1"
-_demo_step = 0
-
-
-def call_llm(prompt: str) -> Dict[str, Any]:
-    """
-    LLM stub. Replace with a real model call that returns a dict.
-    The contract requires JSON with keys: thought, action{name,args}.
-    """
-    # Optional demo mode to exercise tools and reflection without a real LLM.
-    if DEMO_MODE:
-        global _demo_step
-        if "Return JSON with fields: thought, action{name,args}" in prompt:
-            if _demo_step == 0:
-                _demo_step += 1
-                return {
-                    "thought": "read demo file",
-                    "action": {"name": "read_file", "args": {"path": "demo.txt"}},
-                }
-            if _demo_step == 1:
-                _demo_step += 1
-                return {
-                    "thought": "repeat read",
-                    "action": {"name": "read_file", "args": {"path": "demo.txt"}},
-                }
-            if _demo_step == 2:
-                _demo_step += 1
-                return {
-                    "thought": "repeat read again",
-                    "action": {"name": "read_file", "args": {"path": "demo.txt"}},
-                }
-            return {
-                "thought": "stop",
-                "action": {"name": "stop", "args": {"reason": "demo complete"}},
-            }
-        # Reflection prompt
-        return {
-            "outcome": "success",
-            "what_worked": ["tool use", "memory write"],
-            "what_failed": [],
-            "next_time_try": ["validate outputs"],
-            "confidence": 0.8,
-        }
-
-    # Placeholder behavior: stop immediately.
-    return {
-        "thought": "stub",
-        "action": {
-            "name": "stop",
-            "args": {"reason": "LLM not implemented"},
-        },
-    }
-
-
-class ToolRegistry:
-    """Explicit tool registry with schema metadata for safe invocation."""
-
-    def __init__(self) -> None:
-        self._tools: Dict[str, Dict[str, Any]] = {}
-
-    def register(
-        self,
-        name: str,
-        description: str,
-        func: Callable[..., Any],
-        args_schema: Dict[str, str],
-    ) -> None:
-        self._tools[name] = {
-            "name": name,
-            "description": description,
-            "func": func,
-            "args_schema": args_schema,
-        }
-
-    def get(self, name: str) -> Optional[Dict[str, Any]]:
-        return self._tools.get(name)
-
-    def list(self) -> Dict[str, Dict[str, Any]]:
-        # Return a JSON-safe view (exclude callables).
-        safe: Dict[str, Dict[str, Any]] = {}
-        for name, tool in self._tools.items():
-            safe[name] = {
-                "name": tool["name"],
-                "description": tool["description"],
-                "args_schema": tool["args_schema"],
-            }
-        return safe
-
-
-class ShortTermMemory:
-    """Fixed-size memory of recent steps for context summarization."""
-
-    def __init__(self, max_entries: int = 5) -> None:
-        self.max_entries = max_entries
-        self._entries: Deque[Dict[str, Any]] = deque(maxlen=max_entries)
-
-    def add(self, observation: Dict[str, Any], action: Dict[str, Any], result: Dict[str, Any]) -> None:
-        self._entries.append(
-            {
-                "observation": observation,
-                "action": action,
-                "result": result,
-            }
-        )
-
-    def summarize(self, max_chars: int = 200) -> List[Dict[str, Any]]:
-        # Provide a compact view to avoid prompting with raw logs.
-        summary: List[Dict[str, Any]] = []
-        for entry in list(self._entries):
-            action = entry.get("action", {})
-            result = entry.get("result", {})
-            item = {
-                "action": action.get("name"),
-                "result_ok": result.get("ok"),
-                "result_info": _truncate_str(_safe_result_info(result), max_chars),
-            }
-            summary.append(item)
-        return summary
-
-
-class LongTermMemory:
-    """File-backed summaries only; raw logs are never persisted."""
-
-    def __init__(
-        self,
-        path: str,
-        max_entries: int = 100,
-        max_summary_chars: int = 500,
-    ) -> None:
-        self.path = path
-        self.max_entries = max_entries
-        self.max_summary_chars = max_summary_chars
-        self._entries: List[Dict[str, Any]] = []
-        self._load()
-
-    def _load(self) -> None:
-        if not os.path.exists(self.path):
-            self._entries = []
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                self._entries = data
-            else:
-                self._entries = []
-        except Exception:
-            self._entries = []
-
-    def _save(self) -> None:
-        try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self._entries, f)
-        except Exception:
-            # Failing to save should not crash the agent loop.
-            pass
-
-    def add(self, summary: str, tags: List[str]) -> Dict[str, Any]:
-        # Enforce summary limits and prevent duplicates.
-        if not summary or len(summary) > self.max_summary_chars:
-            return {"ok": False, "error": "summary too long or empty"}
-        if not all(isinstance(t, str) and t for t in tags):
-            return {"ok": False, "error": "invalid tags"}
-        if any(e.get("summary") == summary and e.get("tags") == tags for e in self._entries):
-            return {"ok": False, "error": "duplicate entry"}
-
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "summary": summary,
-            "tags": tags,
-        }
-        self._entries.append(entry)
-        # Enforce max size by evicting oldest entries.
-        if len(self._entries) > self.max_entries:
-            self._entries = self._entries[-self.max_entries :]
-        self._save()
-        return {"ok": True, "entry": entry}
-
-    def recent(self, limit: int = 5) -> List[Dict[str, Any]]:
-        return self._entries[-limit:] if self._entries else []
-
-
-class GuardrailManager:
-    """Centralized guardrails to bound execution and prevent runaway behavior."""
-
-    def __init__(
-        self,
-        max_steps: int = 5,
-        max_tool_calls: int = 10,
-        max_calls_per_tool: int = 5,
-        max_token_budget: int = 2000,
-        repetition_threshold: int = 2,
-        invalid_json_limit: int = 2,
-        invalid_tool_limit: int = 2,
-        wall_clock_timeout_sec: Optional[float] = None,
-        drift_check_interval: int = 2,
-        drift_threshold: float = 0.6,
-    ) -> None:
-        self.max_steps = max_steps
-        self.max_tool_calls = max_tool_calls
-        self.max_calls_per_tool = max_calls_per_tool
-        self.max_token_budget = max_token_budget
-        self.repetition_threshold = repetition_threshold
-        self.invalid_json_limit = invalid_json_limit
-        self.invalid_tool_limit = invalid_tool_limit
-        self.wall_clock_timeout_sec = wall_clock_timeout_sec
-        self.drift_check_interval = drift_check_interval
-        self.drift_threshold = drift_threshold
-
-        self.start_time = time.time()
-        self.tool_calls_total = 0
-        self.tool_calls_by_name: Dict[str, int] = {}
-        self.tool_call_history: Deque[str] = deque(maxlen=repetition_threshold + 1)
-        self.estimated_tokens = 0
-        self.invalid_json_count = 0
-        self.invalid_tool_count = 0
-
-    def estimate_tokens(self, text: str) -> int:
-        # Rough heuristic: average 4 chars per token.
-        return max(1, len(text) // 4)
-
-    def record_llm_call(self, prompt: str) -> Optional[Dict[str, Any]]:
-        self.estimated_tokens += self.estimate_tokens(prompt)
-        if self.estimated_tokens > self.max_token_budget:
-            return {
-                "type": "token_budget_exceeded",
-                "detail": {
-                    "budget": self.max_token_budget,
-                    "used": self.estimated_tokens,
-                },
-            }
-        return None
-
-    def record_invalid_json(self) -> Optional[Dict[str, Any]]:
-        self.invalid_json_count += 1
-        if self.invalid_json_count > self.invalid_json_limit:
-            return {"type": "invalid_json_limit_exceeded", "detail": self.invalid_json_count}
-        return None
-
-    def record_invalid_tool(self) -> Optional[Dict[str, Any]]:
-        self.invalid_tool_count += 1
-        if self.invalid_tool_count > self.invalid_tool_limit:
-            return {"type": "invalid_tool_limit_exceeded", "detail": self.invalid_tool_count}
-        return None
-
-    def record_tool_call(self, name: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        self.tool_calls_total += 1
-        self.tool_calls_by_name[name] = self.tool_calls_by_name.get(name, 0) + 1
-        call_sig = f"{name}:{json.dumps(args, sort_keys=True)}"
-        self.tool_call_history.append(call_sig)
-
-        if self.tool_calls_total > self.max_tool_calls:
-            return {
-                "type": "tool_call_budget_exceeded",
-                "detail": {"budget": self.max_tool_calls, "used": self.tool_calls_total},
-            }
-        if self.tool_calls_by_name[name] > self.max_calls_per_tool:
-            return {
-                "type": "per_tool_budget_exceeded",
-                "detail": {"tool": name, "budget": self.max_calls_per_tool},
-            }
-        if (
-            len(self.tool_call_history) == self.tool_call_history.maxlen
-            and len(set(self.tool_call_history)) == 1
-        ):
-            return {
-                "type": "repetition_threshold_exceeded",
-                "detail": {"tool": name, "threshold": self.repetition_threshold},
-            }
-        return None
-
-    def check_wall_clock(self) -> Optional[Dict[str, Any]]:
-        if self.wall_clock_timeout_sec is None:
-            return None
-        if (time.time() - self.start_time) > self.wall_clock_timeout_sec:
-            return {"type": "wall_clock_timeout", "detail": self.wall_clock_timeout_sec}
-        return None
-
-    def check_goal_drift(self, goal: str, focus: str) -> Optional[Dict[str, Any]]:
-        # Simple token overlap heuristic to detect drift without external deps.
-        goal_tokens = set(_normalize_tokens(goal))
-        focus_tokens = set(_normalize_tokens(focus))
-        if not goal_tokens or not focus_tokens:
-            return None
-        overlap = len(goal_tokens & focus_tokens) / max(1, len(goal_tokens | focus_tokens))
-        if overlap < self.drift_threshold:
-            return {
-                "type": "goal_drift_detected",
-                "detail": {"overlap": overlap, "threshold": self.drift_threshold},
-            }
-        return None
-
-
-def _truncate_str(value: str, max_chars: int) -> str:
-    if len(value) <= max_chars:
-        return value
-    return value[: max_chars - 3] + "..."
-
-
-def _safe_result_info(result: Dict[str, Any]) -> str:
-    # Avoid large payloads while still providing useful signal.
-    if "error" in result:
-        return str(result["error"])
-    if "path" in result:
-        return f"path={result['path']}"
-    if "reason" in result:
-        return str(result["reason"])
-    if "bytes" in result:
-        return f"bytes={result['bytes']}"
-    return "ok"
-
-
-def _normalize_tokens(text: str) -> List[str]:
-    # Lightweight tokenization for goal drift heuristics.
-    cleaned = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in text)
-    return [t for t in cleaned.split() if t]
+from guardrails import GuardrailManager
+from llm import call_llm
+from memory import LongTermMemory, ShortTermMemory
+from tools import ToolRegistry
+from utils import truncate_str
 
 
 class Agent:
@@ -353,6 +37,7 @@ class Agent:
         self.step = 0
         self.log: list[Dict[str, Any]] = []
         self.last_result: Optional[Dict[str, Any]] = None
+
         self.short_term = ShortTermMemory(max_entries=short_term_max)
         self.long_term = LongTermMemory(
             path=long_term_path,
@@ -360,6 +45,7 @@ class Agent:
             max_summary_chars=long_term_summary_max,
         )
         self.long_term_recent_limit = long_term_recent_limit
+
         self.guardrails = GuardrailManager(
             max_steps=max_steps,
             max_tool_calls=max_tool_calls,
@@ -372,9 +58,12 @@ class Agent:
             drift_check_interval=drift_check_interval,
             drift_threshold=drift_threshold,
         )
+
         self.tools = ToolRegistry()
         self._register_tools()
         self.max_steps = max_steps
+
+    # ---- Tools ----
 
     def _register_tools(self) -> None:
         # Tools are explicit functions with schemas to keep usage controlled.
@@ -430,6 +119,8 @@ class Agent:
         # The LLM never writes memory directly; the agent validates and persists.
         return {"ok": True, "summary": summary, "tags": tags}
 
+    # ---- Core Loop ----
+
     def observe(self) -> Dict[str, Any]:
         # Capture the current state for the decision step.
         return {
@@ -451,6 +142,7 @@ class Agent:
         budget_stop = self.guardrails.record_llm_call(prompt)
         if budget_stop:
             return self._forced_stop_decision("llm_budget", budget_stop)
+
         decision = call_llm(prompt)
         if not isinstance(decision, dict):
             invalid_stop = self.guardrails.record_invalid_json()
@@ -553,6 +245,7 @@ class Agent:
             action["args"] = args
             decision = dict(decision)
             decision["action"] = action
+
         self.step += 1
         record = {
             "step": self.step,
@@ -575,6 +268,7 @@ class Agent:
                 result = {"status": "stopped", "record": record, "log": self.log}
                 self._post_run_reflection(final_status="stopped", final_record=record)
                 return result
+
             observation = self.observe()
             if self.step % self.guardrails.drift_check_interval == 0 and self.step > 0:
                 focus = json.dumps(observation)
@@ -585,6 +279,7 @@ class Agent:
                     result = {"status": "stopped", "record": record, "log": self.log}
                     self._post_run_reflection(final_status="stopped", final_record=record)
                     return result
+
             decision = self.decide(observation)
             record = self.act(observation, decision)
             decision = record["decision"]
@@ -596,6 +291,7 @@ class Agent:
                 }
                 self._post_run_reflection(final_status="stopped", final_record=record)
                 return result
+
         stop_reason = {"type": "max_steps_reached", "detail": {"max_steps": max_steps}}
         result = {
             "status": "max_steps_reached",
@@ -604,6 +300,8 @@ class Agent:
         }
         self._post_run_reflection(final_status="max_steps_reached", final_record=result["record"])
         return result
+
+    # ---- Reflection ----
 
     def _post_run_reflection(self, final_status: str, final_record: Optional[Dict[str, Any]]) -> None:
         # Reflection is separated from action to prevent tool execution during evaluation.
@@ -688,7 +386,9 @@ class Agent:
         if reflection["next_time_try"]:
             parts.append("next=" + "; ".join(reflection["next_time_try"]))
         summary = " | ".join(parts)
-        return _truncate_str(summary, self.long_term.max_summary_chars)
+        return truncate_str(summary, self.long_term.max_summary_chars)
+
+    # ---- Stop Helpers ----
 
     def _forced_stop_decision(self, reason_type: str, detail: Dict[str, Any]) -> Dict[str, Any]:
         # Structured stop reasons are required for guardrail-triggered exits.
